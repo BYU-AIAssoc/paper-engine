@@ -1,0 +1,28 @@
+name: Sync Fork From Upstream
+
+# Keeps BYU-AIAssoc/paper-engine up to date with its upstream,
+# mercer-science/paper-engine, using GitHub's native "sync fork"
+# (merge-upstream) API. Runs on a weekly schedule and can also be
+# triggered by hand from the Actions tab.
+
+on:
+  schedule:
+    # Every Monday at 06:00 UTC
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge upstream into main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${{ github.repository }}/merge-upstream" \
+            -f branch=main
