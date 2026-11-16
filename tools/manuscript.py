@@ -21236,6 +21236,29 @@ def _package_header(name: str, journal: str, says: str) -> str:
     return "# %s - %s: %s\n" % (title, journal_folder(journal), says)
 
 
+def _package_provenance(name: str, journal: str, says: str) -> str:
+    """The same provenance as `_package_header`, but as an HTML comment.
+
+    The cover letter and the title page are the two package files that go to
+    the journal as DOCUMENTS - pandoc builds a `.docx` from each. A visible
+    `# Cover letter - jacmp: ... template` heading at the top, which is what
+    `_package_header` emits, becomes the first heading of that .docx and
+    reaches the editor: a letter that opens by announcing the requirement it
+    was written against, and the word "template", on the page a human reads.
+    That is item one of the submission sweep ("scan every upload doc for
+    meta/placeholder text") failing at the source.
+
+    So these two carry their provenance as a comment instead. pandoc's docx
+    writer drops raw HTML, so the line stays in the `.md` the user edits - it
+    still says whether the journal asked for the file and in whose words - and
+    never appears in the built document. The guidance files that stay markdown
+    (`statements`, `suggested_reviewers`, `checklist`) keep the visible
+    `_package_header`; they are read as markdown, not uploaded as documents.
+    """
+    title = name.replace("_", " ").capitalize()
+    return "<!-- %s - %s: %s -->\n" % (title, journal_folder(journal), says)
+
+
 def _cover_letter_md(project: str, journal: str, req: dict, ta: dict,
                      info: dict, rnd: int, says: str) -> str:
     editor = (req.get("submission.editor") or "").strip()
@@ -21243,7 +21266,7 @@ def _cover_letter_md(project: str, journal: str, req: dict, ta: dict,
         editor = ""
     rows = info.get("authors") or []
     corr = (info.get("corresponding") or "").strip()
-    lines = [_package_header("cover_letter", journal, says), "",
+    lines = [_package_provenance("cover_letter", journal, says), "",
              TODAY, "",
              "Dear %s," % (editor or "Editor"), ""]
     if not editor:
@@ -21340,10 +21363,19 @@ def _cover_letter_md(project: str, journal: str, req: dict, ta: dict,
 def _title_page_md(project: str, journal: str, req: dict, ta: dict,
                    info: dict, says: str) -> str:
     counts = (_prose(project, "length").get("counts") or {})
-    lines = [_package_header("title_page", journal, says), ""]
-    lines += ["## Title", "", ta.get("title")
-              or "**[FLAG: author]** no title in "
-                 "`%stitle_abstract.md`" % stpfx(project), ""]
+    # The title page is the second document pandoc builds (see
+    # `_package_provenance`), so it carries no visible meta heading either, and
+    # it OPENS WITH THE ACTUAL TITLE rather than a "## Title" label: an editor
+    # screening the page should read the paper's title first, not the word
+    # "Title". The title is the document's own H1; when there is none yet, the
+    # flag stands where the title would, which is what keeps the page not
+    # sendable until it is written.
+    lines = [_package_provenance("title_page", journal, says), ""]
+    if ta.get("title"):
+        lines += ["# " + ta["title"], ""]
+    else:
+        lines += ["**[FLAG: author]** no title in "
+                  "`%stitle_abstract.md`" % stpfx(project), ""]
     lines += ["## Running head", "", ta.get("running_title")
               or "**[FLAG: author]** no running title recorded", ""]
     block = author_block(info)
@@ -22521,6 +22553,100 @@ def conflict_warnings(coi: dict) -> list[str]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Reading a built package .docx back - the automated half of "open it and
+# check it looks right before you send it"
+# ---------------------------------------------------------------------------
+#
+# The cover letter and the title page are the two package files pandoc builds
+# into documents an editor opens. The manuscript is read back by `format-check`
+# and held to requirements.yml; these two never were, so a meta heading pandoc
+# rendered from the markdown, or a blue theme heading from a missing reference
+# document, reached the journal with nothing between it and the editor. The
+# engine builds and then trusts. These two checks read the built file back:
+# one for text that is scaffolding rather than content, one for the Word-theme
+# styling the reference document is meant to displace. A leak or a themed
+# heading is a BLOCKER - the package is not sendable until the built file is
+# clean - which is the automated floor under the manual by-eye pass the skill
+# now requires on top of it.
+
+# Scaffolding text that must never reach an editor in a built deliverable: the
+# provenance pandoc is meant to drop, a bracketed date placeholder, or an
+# instruction written to the author. "template" is NOT scanned for on its own -
+# a paper's real title may carry the word - only as part of the header pattern.
+_PKG_LEAK_PHRASES = ("<!--", "-->", "[date]", "transfer this", "paste this",
+                     "paste into", "editors only", "journal template")
+_PKG_HEADER_RE = re.compile(
+    r"(?i)^\s*(cover letter|title page|statements|suggested reviewers|"
+    r"checklist|ai disclosure)\s*[-–]\s*.+:\s")
+
+
+def _package_docx_leaks(path: str) -> list[str]:
+    """Meta/placeholder text that reached a built package .docx (empty = clean).
+
+    Reads the document back and names anything that is scaffolding rather than
+    the letter or the title page itself - the first item of the submission
+    sweep ("scan every upload doc for meta/placeholder text"), run by the
+    engine rather than left to the eye.
+    """
+    try:
+        doc = _docx_part(path, "word/document.xml")
+    except Exception:
+        return []
+    low = " ".join(_WT_RE.findall(doc)).lower()
+    out: list[str] = []
+    for phrase in _PKG_LEAK_PHRASES:
+        if phrase in low:
+            out.append("the text %r" % phrase)
+    for p in re.findall(r"<w:p\b.*?</w:p>", doc, re.S):
+        pt = " ".join(_WT_RE.findall(p)).strip()
+        if _PKG_HEADER_RE.match(pt):
+            out.append("a package-header line (%r)" % pt[:60])
+            break
+    return out
+
+
+def _package_docx_theme(path: str, font: str) -> list[str]:
+    """Word-theme styling in a built package .docx - a blue heading or a theme
+    font where the plain manuscript styling asks for black and one named face.
+
+    The same failure as a manuscript built without a reference document, and
+    the same one the user sees as "strange headers and font colours". Returns a
+    description per offending style, empty when every used style is plain.
+    """
+    try:
+        styles = _style_index(_docx_part(path, "word/styles.xml"))
+        doc = _docx_part(path, "word/document.xml")
+    except Exception:
+        return []
+    theme = _theme_fonts(path)
+    used = ({h["style"] for h in _headings(doc)}
+            | {"Normal", "BodyText", "FirstParagraph", "Heading1"})
+    out: list[str] = []
+    for sid in sorted(s for s in used if s):
+        s = styles.get(sid)
+        if not s:
+            continue
+        if s.get("theme_color"):
+            out.append("%s takes its colour from the Word theme "
+                       "(themeColor=%s), which renders as a coloured heading, "
+                       "not black" % (sid, s["theme_color"]))
+        else:
+            col = (s.get("color") or "000000").lower()
+            if col not in ("000000", "auto"):
+                out.append("%s is #%s, not black" % (sid, col))
+        if s.get("theme_font"):
+            kind = "major" if "major" in (s["theme_font"] or "") else "minor"
+            resolved = theme.get(kind, "")
+            if _font_key(resolved) != _font_key(font):
+                out.append("%s uses the Word theme font %s (%s), not %s"
+                           % (sid, s["theme_font"], resolved or "the default",
+                              font))
+        elif s.get("font") and _font_key(s["font"]) != _font_key(font):
+            out.append("%s font is %s, not %s" % (sid, s["font"], font))
+    return out
+
+
 def submission_package(project: str, journal: str,
                        dry_run: bool = False) -> dict:
     """The five files, written into submission/ beside the manuscript.
@@ -22608,6 +22734,26 @@ def submission_package(project: str, journal: str,
     os.makedirs(sdir, exist_ok=True)
     pandoc = shutil.which("pandoc")
     ref_doc = os.path.join(jdir, "journal_requirements", "reference.docx")
+    # The cover letter and the title page are built by pandoc too, so without a
+    # reference document they inherit pandoc's default Word theme - Aptos
+    # Display headings in #0F4761 blue over the body font - exactly like a
+    # manuscript built without one. `assemble` builds reference.docx; a user
+    # who runs `submission-package` before assembling would otherwise upload a
+    # blue-headed cover letter. Build it here too when it is missing, and say
+    # so if it cannot be built, so the two .docx carry the plain manuscript
+    # styling rather than Word's theme.
+    wants_docx = any(e == "docx" for _n, e, _k, _w in package)
+    if pandoc and wants_docx and not os.path.isfile(ref_doc):
+        made = reference_doc(project, journal)
+        warnings += made.get("warnings", []) + made.get("errors", [])
+    if pandoc and wants_docx and not os.path.isfile(ref_doc):
+        warnings.append(
+            "no journal_requirements/reference.docx and it could not be "
+            "built, so cover_letter and title_page carry pandoc's default "
+            "Word theme (blue Aptos headings) rather than the plain "
+            "manuscript styling; run `manuscript.py reference-doc`")
+    pkg_font, _pkg_size, _ = _req_font(req)
+    doc_blockers: list[str] = []
     for name, ext, _key, _what in package:
         stem = "%s_r%d" % (name, rnd)
         md_path = os.path.join(sdir, stem + ".md")
@@ -22634,6 +22780,22 @@ def submission_package(project: str, journal: str,
                                        (run.stderr or "").strip()[:200]))
                 else:
                     out = docx
+                    # Read the built document back - the automated half of
+                    # "check it looks right before you send it". Meta text or a
+                    # Word-theme heading reached an editor on BgRT; here each is
+                    # a blocker, caught by the engine rather than left to the
+                    # eye (which the skill still requires on top of this).
+                    for d in _package_docx_leaks(docx):
+                        doc_blockers.append(
+                            "%s_r%d.docx carries %s - meta/placeholder text, "
+                            "not content. It is built from the markdown beside "
+                            "it, so the leak is there" % (name, rnd, d))
+                    for d in _package_docx_theme(docx, pkg_font):
+                        doc_blockers.append(
+                            "%s_r%d.docx: %s. Rebuild "
+                            "journal_requirements/reference.docx with "
+                            "`manuscript.py reference-doc` and run the package "
+                            "again" % (name, rnd, d))
         written.append({"path": os.path.relpath(out, project),
                         "flags": bodies[name].count("**[FLAG:")})
 
@@ -22651,7 +22813,7 @@ def submission_package(project: str, journal: str,
     # Items 141, 153 and 155: what keeps a package NOT SENDABLE besides its
     # flags. Each is something the journal's own rules say and the build
     # cannot yet show it honours.
-    blockers = package_blockers(project, journal, req, rnd)
+    blockers = package_blockers(project, journal, req, rnd) + doc_blockers
     for b in blockers:
         warnings.append("NOT SENDABLE - " + b)
     supp_pdf = os.path.join(sdir, "supplementary_info_r%d.pdf" % rnd)
